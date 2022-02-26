@@ -1594,6 +1594,8 @@ def do_run(args, return_display=False, debug=True):
                             print(torch.cuda.memory_summary())
                             print("TENSORS")
                             print(torch.cuda.memory_allocated())
+                            with open("snap.txt","w") as f:
+                                f.write(str(torch.cuda.memory_snapshot()))
                         raise e
         except KeyboardInterrupt:
             pass
