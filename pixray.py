@@ -1501,7 +1501,7 @@ def check_new_filelist(filelist_old_source, filelist_old, filelist_cur_source, f
 
 # return only once to run only one iteration
 # returns True when complete, False otherwise
-def do_run(args, return_display=False, debug=False):
+def do_run(args, return_display=False, debug=True):
     global cur_iteration, cur_anim_index
     global anim_cur_zs, anim_next_zs, anim_output_files
 
