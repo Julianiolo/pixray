@@ -1501,7 +1501,7 @@ def check_new_filelist(filelist_old_source, filelist_old, filelist_cur_source, f
 
 # return only once to run only one iteration
 # returns True when complete, False otherwise
-def do_run(args, return_display=False):
+def do_run(args, return_display=False, debug=False):
     global cur_iteration, cur_anim_index
     global anim_cur_zs, anim_next_zs, anim_output_files
 
@@ -1589,6 +1589,11 @@ def do_run(args, return_display=False):
                     except RuntimeError as e:
                         print("Oops: runtime error: ", e)
                         print("Try reducing --num-cuts to save memory")
+                        if debug:
+                            print("SUMMARY:")
+                            print(torch.cuda.memory_summary())
+                            print("TENSORS")
+                            print(torch.cuda.memory_allocated())
                         raise e
         except KeyboardInterrupt:
             pass
