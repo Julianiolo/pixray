@@ -47,6 +47,7 @@ import re
 import random
 
 from einops import rearrange
+import timit
 
 from filters.colorlookup import ColorLookup
 from filters.wallpaper import WallpaperFilter
@@ -95,15 +96,18 @@ try:
     from clipdrawer import ClipDrawer
     from pixeldrawer import PixelDrawer
     from linedrawer import LineDrawer
+    from fast_pixeldrawer import FastPixelDrawer
     # update class_table if these import OK
     class_table.update({
         "line_sketch": LineDrawer,
         "pixel": PixelDrawer,
-        "clipdraw": ClipDrawer
+        "clipdraw": ClipDrawer,
+        "fast_pixel": FastPixelDrawer
     })
 except ImportError as e:
     print("--> Not running with pydiffvg drawer support ", e)
     pass
+
 
 try:
     import matplotlib.colors
@@ -183,6 +187,7 @@ def ramp(ratio, width):
 
 # NR: Testing with different intital images
 def old_random_noise_image(w,h):
+    print("generating random snow noise image: {}x{}".format(w,h))
     random_image = Image.fromarray(np.random.randint(0,255,(w,h,3),dtype=np.dtype('uint8')))
     return random_image
 
@@ -198,6 +203,7 @@ def contrast_noise(n):
     return n3
 
 def random_noise_image(w,h):
+    print("generating random noise image: {}x{}".format(w,h))
     # scale up roughly as power of 2
     if (w>1024 or h>1024):
         side, octp = 2048, 6
@@ -234,6 +240,7 @@ def gradient_3d(width, height, start_list, stop_list, is_horizontal_list):
 
     
 def random_gradient_image(w,h):
+    print("generating random gradient noise image: {}x{}".format(w,h))
     array = gradient_3d(w, h, (0, 0, np.random.randint(0,255)), (np.random.randint(1,255), np.random.randint(2,255), np.random.randint(3,128)), (True, False, False))
     random_image = Image.fromarray(np.uint8(array))
     return random_image
@@ -327,7 +334,7 @@ class MyRandomPerspective(K.RandomPerspective):
             align_corners=self.flags["align_corners"], padding_mode=global_padding_mode
         )
 
-global_fill_color=None;
+global_fill_color=None
 # override class to get fill color
 class MyRandomAffine(K.RandomAffine):
     def apply_transform(
@@ -451,6 +458,7 @@ class MakeCutouts(nn.Module):
                 mask_indexes = spot_indexes[0]
             # print("Mask indexes ", mask_indexes)
 
+        timit.timit.start("cutmk")
         for _ in range(self.cutn):
             # Pooling
             cutout = (self.av_pool(input) + self.max_pool(input))/2
@@ -469,7 +477,9 @@ class MakeCutouts(nn.Module):
             #     TF.to_pil_image(cutout[0].cpu()).save(f"cutout_im_{cur_iteration:02d}_{spot}.png")
 
             cutouts.append(cutout)
+        timit.timit.stop("cutmk")
 
+        timit.timit.start("cuttf")
         if self.transforms is not None:
             # print("Cached transforms available")
             batch1 = kornia.geometry.transform.warp_perspective(torch.cat(cutouts[:self.cutn_zoom], dim=0), self.transforms[:self.cutn_zoom],
@@ -495,13 +505,17 @@ class MakeCutouts(nn.Module):
             #         TF.to_pil_image(batch[j].cpu()).save(f"live_im_{cur_iteration:02d}_{j:02d}_{spot}.png")
             #         j_wide = j + self.cutn_zoom
             #         TF.to_pil_image(batch[j_wide].cpu()).save(f"live_im_{cur_iteration:02d}_{j_wide:02d}_{spot}.png")
+        timit.timit.stop("cuttf")
 
         # print(batch.shape, self.transforms.shape)
-        
-        if self.noise_fac:
+        bounds = [0,1]
+
+        if self.noise_fac and False:
             facs = batch.new_empty([self.cutn, 1, 1, 1]).uniform_(0, self.noise_fac)
-            batch = batch + facs * torch.randn_like(batch)
-        return batch
+            ran = torch.randn_like(batch)
+            batch = batch + facs * ran
+            bounds = [int(batch.min()),int(batch.max())]
+        return batch, bounds
 
 
 def resize_image(image, out_size):
@@ -597,6 +611,8 @@ def do_init(args):
     torch.manual_seed(seed)
     np.random.seed(int_seed)
     random.seed(int_seed)
+
+    #device = torch.device("cpu")
 
     # set device only once
     if device is None:
@@ -1191,7 +1207,8 @@ def checkin(args, iter, losses):
             display.display(display.Image(outfile))
     tqdm.write(writestr)
 
-def ascend_txt(args):
+
+def ascend_txt(args): # judge image?
     global cur_iteration, cur_anim_index, perceptors, cutoutsTable, cutoutSizeTable # normalize, 
     global z_orig, im_targets, z_labels, init_image_tensor, target_image_tensor, drawer
     global pmsTable, pmsImageTable, spotPmsTable, spotOffPmsTable, global_padding_mode, global_fill_color
@@ -1209,7 +1226,7 @@ def ascend_txt(args):
         for f in filters:
             filtclass = f["filter"]
             filtweight = f["weight"]
-            out, new_losses = filtclass(out);
+            out, new_losses = filtclass(out)
             if type(new_losses) is not list and type(new_losses) is not tuple:
                 result.append(filtweight * new_losses)
             else:
@@ -1230,9 +1247,12 @@ def ascend_txt(args):
     cur_cutouts = {}
     cur_spot_cutouts = {}
     cur_spot_off_cutouts = {}
+    timit.timit.start("cut")
     for cutoutSize in cutoutsTable:
         make_cutouts = cutoutsTable[cutoutSize]
-        cur_cutouts[cutoutSize] = make_cutouts(out)
+        res, bounds = make_cutouts(out)
+        cur_cutouts[cutoutSize] = [res,bounds]
+    timit.timit.stop("cut")
 
     if args.spot_prompts:
         for cutoutSize in cutoutsTable:
@@ -1259,11 +1279,17 @@ def ascend_txt(args):
             for prompt in spotOffPms:
                 result.append(prompt(iii_so))
 
-        iii = perceptor.encode_image(cur_cutouts[cutoutSize]).float()
 
+        timit.timit.start("enc")
+        [cutout, bounds] = cur_cutouts[cutoutSize]
+        iii = perceptor.encode_image(cutout,input_range=bounds).float()
+        timit.timit.stop("enc")
+
+        timit.timit.start("prompt")
         pMs = pmsTable[clip_model]
         for prompt in pMs:
             result.append(prompt(iii))
+        timit.timit.stop("prompt")
 
         # add target frame prompts if applicable
         if cur_anim_index is not None and len(pmsTargetTable[clip_model]) > 0:
@@ -1397,7 +1423,7 @@ def apply_overlay(args, cur_it):
             (cur_it % args.overlay_every) == args.overlay_offset and \
             ((args.overlay_until is None) or (cur_it < args.overlay_until))
 
-def train(args, cur_it):
+def train(args, cur_it: int) -> bool:
     global drawer, opts
     global best_loss, best_iter, best_z, num_loss_drop, max_loss_drops, iter_drop_delay
     global overlay_image_rgba, overlay_image_rgba_list, cur_anim_index, init_image_rgba_list
@@ -1427,26 +1453,37 @@ def train(args, cur_it):
         # num_batches = args.batches * (num_loss_drop + 1)
         num_batches = args.batches
         for i in range(num_batches):
+            timit.timit.start("ascend")
             lossAll = ascend_txt(args)
+            timit.timit.stop("ascend")
 
+            timit.timit.start("check")
             if i == 0:
+                # check for lerning rate drop?
                 if cur_anim_index is None or cur_anim_index == 0:
                     if cur_it in args.learning_rate_drops:
                         print("Dropping learning rate")
                         rebuild_opts_when_done = True
                     else:
-                        did_drop = checkdrop(args, cur_it, lossAll)
                         if args.auto_stop is True:
-                            rebuild_opts_when_done = did_drop
+                            rebuild_opts_when_done = checkdrop(args, cur_it, lossAll)
 
-            if i == 0 and cur_it % args.save_every == 0:
-                checkin(args, cur_it, lossAll)
+                # save/display image?
+                if cur_it % args.save_every == 0:
+                    checkin(args, cur_it, lossAll)
 
+            timit.timit.stop("check")
+            
+            timit.timit.start("back")
             loss = sum(lossAll)
             loss.backward()
+            del loss
+            timit.timit.stop("back")
 
+        timit.timit.start("step")
         for opt in opts:
             opt.step()
+        timit.timit.stop("step")
 
         drawer.clip_z()
 
@@ -1577,7 +1614,9 @@ def do_run(args, return_display=False, debug=True):
             with tqdm() as pbar:
                 while keep_going:
                     try:
+                        timit.timit.start("train")
                         keep_going = train(args, cur_iteration)
+                        timit.timit.stop("train")
                         if cur_iteration == args.iterations:
                             break
                         cur_iteration += 1
@@ -1594,8 +1633,8 @@ def do_run(args, return_display=False, debug=True):
                             print(torch.cuda.memory_summary())
                             print("TENSORS")
                             print(torch.cuda.memory_allocated())
-                            with open("snap.txt","w") as f:
-                                f.write(str(torch.cuda.memory_snapshot()))
+                            # with open("snap.txt","w") as f:
+                            #     f.write(str(torch.cuda.memory_snapshot()))
                         raise e
         except KeyboardInterrupt:
             pass
@@ -1822,7 +1861,7 @@ def process_args(vq_parser, namespace=None):
     if args.batches is None:
         args.batches = quality_to_batches_table[args.quality]
     if args.ezsize is None and args.scale is None:
-        args.scale = quality_to_scale_table[args.quality]
+        args.scale = quality_to_scale_table[args.quality] if args.drawer not in ["fast_pixel"] else 2
 
     size_to_scale_table = {
         'small': 1,
@@ -2052,11 +2091,21 @@ def command_line_override():
 
 # super-userful one stop shopping from notebooks or other python code
 def run(prompts=None, drawer="vqgan", **kwargs):
+    timit.timit.init()
     reset_settings()
     add_settings(prompts=prompts, drawer=drawer, **kwargs)
     settings = apply_settings()
+
+    timit.timit.start("init")
     do_init(settings)
+    timit.timit.stop("init")
+    timit.timit.start("run")
     do_run(settings)
+    timit.timit.stop("run")
+
+    print("done")
+    timit.timit.end()
+    timit.timit.print()
 
 def main():
     settings = apply_settings()
@@ -2065,6 +2114,7 @@ def main():
     do_run(settings)
     # global drawer
     # drawer.to_svg()
+    
 
 if __name__ == '__main__':
     main()

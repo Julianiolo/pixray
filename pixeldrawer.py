@@ -18,6 +18,7 @@ from util import str2bool
 
 from perlin_numpy import generate_fractal_noise_3d
 
+# get rect verts from corners
 def rect_from_corners(p0, p1):
     x1, y1 = p0
     x2, y2 = p1

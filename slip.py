@@ -10,6 +10,8 @@ from torchvision import transforms
 
 from clip import clip
 
+import timit
+
 all_slip_models =  ["SLIP_VITS16", "SLIP_VITB16", "SLIP_VITL16",
                     "SLIP_CC3M", "SLIP_CC12M",
                     "SIMCLR_VITS16",
@@ -36,9 +38,13 @@ def normalize(img, input_range = None):
     return img
 
 def adjust_range(img, out_range, input_range = None):
+    timit.timit.start("adj")
+    timit.timit.start("norm")
     img = normalize(img, input_range = input_range)
+    timit.timit.stop("norm")
     img = img * (out_range[1] - out_range[0])
     img = img + out_range[0]
+    timit.timit.stop("adj")
     return img
 
 class CLIP_Base():
@@ -53,17 +59,47 @@ class CLIP_Base():
             transforms.Resize(self.input_resolution),
             transforms.CenterCrop(self.input_resolution),
             transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
-            ])
+        ])
+
+        # self.pre_R = transforms.Resize(self.input_resolution)
+        # self.pre_C = transforms.CenterCrop(self.input_resolution)
+        # self.pre_N = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
 
     def preprocess(self, imgs, input_range = None):
         imgs = adjust_range(imgs, [0.,1.], input_range = input_range)
-        return self.preprocess_transform(imgs)
+
+        proc = None
+        timit.timit.start("tf")
+        if True:
+            proc = self.preprocess_transform(imgs)
+        else:
+            timit.timit.start("tf-r")
+            p1 = self.pre_R(imgs)
+            timit.timit.stop("tf-r")
+            timit.timit.start("tf-c")
+            p2 = self.pre_C(p1)
+            timit.timit.stop("tf-c")
+            timit.timit.start("tf-n")
+            proc = self.pre_N(p2)
+            timit.timit.stop("tf-n")
+
+        timit.timit.stop("tf")
+        return proc
 
     def encode_image(self, imgs, input_range = None, apply_preprocess = True):
         if apply_preprocess:
-            imgs = self.preprocess(imgs, input_range = None)
+            timit.timit.start("preproc")
+            imgs = self.preprocess(imgs, input_range = input_range)
+            timit.timit.stop("preproc")
+        
+        timit.timit.start("encmod")
         img_embeddings = self.model.encode_image(imgs)
-        return img_embeddings / img_embeddings.norm(dim=-1, keepdim=True)
+        timit.timit.stop("encmod")
+
+        timit.timit.start("encnorm")
+        ret = img_embeddings / img_embeddings.norm(dim=-1, keepdim=True)
+        timit.timit.stop("encnorm")
+        return ret
 
     def encode_text(self, text):
         text = clip.tokenize(text).to(self.device)
@@ -150,7 +186,9 @@ class SLIP_Base():
 
     def encode_image(self, imgs, input_range = None, apply_preprocess = True):
         if apply_preprocess:
+            timit.timit.start("preproc")
             imgs = self.preprocess(imgs, input_range = input_range)
+            timit.timit.stop("preproc")
 
         image_features = self.model.encode_image(imgs)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
