@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import logging
+from pickle import FALSE
 
 from urllib.request import urlopen
 import sys
@@ -41,13 +42,15 @@ from clip import clip
 
 import kornia
 import kornia.augmentation as K
+from kornia.constants import Resample
 import numpy as np
 import imageio
 import re
 import random
 
 from einops import rearrange
-import timit
+from timit import timit
+from torch.profiler import record_function
 
 from filters.colorlookup import ColorLookup
 from filters.wallpaper import WallpaperFilter
@@ -96,7 +99,7 @@ try:
     from clipdrawer import ClipDrawer
     from pixeldrawer import PixelDrawer
     from linedrawer import LineDrawer
-    from fast_pixeldrawer import FastPixelDrawer
+    from fast_pixeldrawer3 import FastPixelDrawer
     # update class_table if these import OK
     class_table.update({
         "line_sketch": LineDrawer,
@@ -320,7 +323,7 @@ def parse_prompt(prompt):
     # print(f"parsed vals is {textPrompt}, {weight}, {stop}")
     return textPrompt, weight, stop
 
-from typing import cast, Dict, List, Optional, Tuple, Union
+from typing import OrderedDict, cast, Dict, List, Optional, Tuple, Union
 
 # override class to get padding_mode
 class MyRandomPerspective(K.RandomPerspective):
@@ -398,7 +401,7 @@ def fetch_spot_indexes(sideX, sideY):
 # f[0].shape = [60,3]
 
 class MakeCutouts(nn.Module):
-    def __init__(self, cut_size, cutn, cut_pow=1.):
+    def __init__(self, cut_size, cutn, args, cut_pow=1.):
         global global_aspect_width
 
         super().__init__()
@@ -408,35 +411,62 @@ class MakeCutouts(nn.Module):
         self.cut_pow = cut_pow
         self.transforms = None
 
-        augmentations = []
-        # if global_aspect_width != 1:
-        #     augmentations.append(K.RandomCrop(size=(self.cut_size,self.cut_size), p=1.0, cropping_mode="resample", return_transform=True))
-        augmentations.append(MyRandomPerspective(distortion_scale=0.40, p=0.7, return_transform=True))
-        augmentations.append(K.RandomResizedCrop(size=(self.cut_size,self.cut_size), scale=(0.25,0.95),  ratio=(0.85,1.2), cropping_mode='resample', p=1.0, return_transform=True))
-        augmentations.append(K.ColorJitter(hue=0.1, saturation=0.1, p=0.8, return_transform=True))
-        self.augs_zoom = nn.Sequential(*augmentations)
 
-        augmentations = []
-        if global_aspect_width == 1:
-            n_s = 0.95
-            n_t = (1-n_s)/2
-            augmentations.append(MyRandomAffine(degrees=0, translate=(n_t, n_t), scale=(n_s, n_s), p=1.0, return_transform=True))
-        elif global_aspect_width > 1:
-            n_s = 1/global_aspect_width
-            n_t = (1-n_s)/2
-            augmentations.append(MyRandomAffine(degrees=0, translate=(0, n_t), scale=(0.9*n_s, n_s), p=1.0, return_transform=True))
+        if args.drawer in ["pixel","fast_pixel"] and False:
+            augmentations = []
+            augmentations.append(transforms.RandomResizedCrop(size=(self.cut_size,self.cut_size), scale=(0.25,0.95),  ratio=(0.85,1.2),interpolation=transforms.InterpolationMode.NEAREST))
+            augmentations.append(transforms.ColorJitter(hue=0.1, saturation=0.1))
+            self.augs_zoom = nn.Sequential(*augmentations)
+
+            augmentations = []
+            if global_aspect_width == 1:
+                n_s = 0.95
+                n_t = (1-n_s)/2
+                augmentations.append(transforms.RandomAffine(degrees=0, translate=(n_t, n_t), scale=(n_s, n_s),interpolation=transforms.InterpolationMode.NEAREST))
+            elif global_aspect_width > 1:
+                n_s = 1/global_aspect_width
+                n_t = (1-n_s)/2
+                augmentations.append(transforms.RandomAffine(degrees=0, translate=(0, n_t), scale=(0.9*n_s, n_s),interpolation=transforms.InterpolationMode.NEAREST))
+            else:
+                n_s = global_aspect_width
+                n_t = (1-n_s)/2
+                augmentations.append(transforms.RandomAffine(degrees=0, translate=(n_t, 0), scale=(0.9*n_s, n_s),interpolation=transforms.InterpolationMode.NEAREST))
+
+            augmentations.append(transforms.CenterCrop(size=self.cut_size))
+            augmentations.append(transforms.ColorJitter(hue=0.1, saturation=0.1))
+            self.augs_wide = nn.Sequential(*augmentations)
+
+            self.noise_fac = 0
         else:
-            n_s = global_aspect_width
-            n_t = (1-n_s)/2
-            augmentations.append(MyRandomAffine(degrees=0, translate=(n_t, 0), scale=(0.9*n_s, n_s), p=1.0, return_transform=True))
+            augmentations = []
+            # if global_aspect_width != 1:
+            #     augmentations.append(K.RandomCrop(size=(self.cut_size,self.cut_size), p=1.0, cropping_mode="resample", return_transform=True))
+            augmentations.append(MyRandomPerspective(distortion_scale=0.40, p=0.7, return_transform=True))
+            augmentations.append(K.RandomResizedCrop(size=(self.cut_size,self.cut_size), scale=(0.25,0.95),  ratio=(0.85,1.2), cropping_mode='resample', p=1.0, return_transform=True))
+            augmentations.append(K.ColorJitter(hue=0.1, saturation=0.1, p=0.8, return_transform=True))
+            self.augs_zoom = nn.Sequential(*augmentations)
 
-        # augmentations.append(K.CenterCrop(size=(self.cut_size,self.cut_size), p=1.0, cropping_mode="resample", return_transform=True))
-        augmentations.append(K.CenterCrop(size=self.cut_size, cropping_mode='resample', p=1.0, return_transform=True))
-        augmentations.append(MyRandomPerspectivePadded(distortion_scale=0.20, p=0.7, return_transform=True))
-        augmentations.append(K.ColorJitter(hue=0.1, saturation=0.1, p=0.8, return_transform=True))
-        self.augs_wide = nn.Sequential(*augmentations)
+            augmentations = []
+            if global_aspect_width == 1:
+                n_s = 0.95
+                n_t = (1-n_s)/2
+                augmentations.append(MyRandomAffine(degrees=0, translate=(n_t, n_t), scale=(n_s, n_s), p=1.0, return_transform=True))
+            elif global_aspect_width > 1:
+                n_s = 1/global_aspect_width
+                n_t = (1-n_s)/2
+                augmentations.append(MyRandomAffine(degrees=0, translate=(0, n_t), scale=(0.9*n_s, n_s), p=1.0, return_transform=True))
+            else:
+                n_s = global_aspect_width
+                n_t = (1-n_s)/2
+                augmentations.append(MyRandomAffine(degrees=0, translate=(n_t, 0), scale=(0.9*n_s, n_s), p=1.0, return_transform=True))
 
-        self.noise_fac = 0.1
+            # augmentations.append(K.CenterCrop(size=(self.cut_size,self.cut_size), p=1.0, cropping_mode="resample", return_transform=True))
+            augmentations.append(K.CenterCrop(size=self.cut_size, cropping_mode='resample', p=1.0, return_transform=True))
+            augmentations.append(MyRandomPerspectivePadded(distortion_scale=0.20, p=0.7, return_transform=True))
+            augmentations.append(K.ColorJitter(hue=0.1, saturation=0.1, p=0.8, return_transform=True))
+            self.augs_wide = nn.Sequential(*augmentations)
+
+            self.noise_fac = 0.1
         
         # Pooling
         self.av_pool = nn.AdaptiveAvgPool2d((self.cut_size, self.cut_size))
@@ -458,63 +488,83 @@ class MakeCutouts(nn.Module):
                 mask_indexes = spot_indexes[0]
             # print("Mask indexes ", mask_indexes)
 
-        timit.timit.start("cutmk")
-        for _ in range(self.cutn):
-            # Pooling
-            cutout = (self.av_pool(input) + self.max_pool(input))/2
 
-            if mask_indexes is not None:
-                cutout[0][mask_indexes] = 0.0 # 0.5
+        with timit.time("cutmk"), record_function("cutmk"):
+            for _ in range(self.cutn):
+                # Pooling
+                cutout = (self.av_pool(input) + self.max_pool(input))/2
 
-            if global_aspect_width != 1:
-                if global_aspect_width > 1:
-                    cutout = kornia.geometry.transform.rescale(cutout, (1, global_aspect_width))
+                if mask_indexes is not None:
+                    cutout[0][mask_indexes] = 0.0 # 0.5
+
+                if global_aspect_width != 1:
+                    if global_aspect_width > 1:
+                        cutout = kornia.geometry.transform.rescale(cutout, (1, global_aspect_width))
+                    else:
+                        cutout = kornia.geometry.transform.rescale(cutout, (1/global_aspect_width, 1))
+
+                # if cur_iteration % 50 == 0 and _ == 0:
+                #     print(cutout.shape)
+                #     TF.to_pil_image(cutout[0].cpu()).save(f"cutout_im_{cur_iteration:02d}_{spot}.png")
+
+                cutouts.append(cutout)
+
+        with timit.time("cuttf"), record_function("cuttf"):
+            if self.transforms is not None:
+                # print("Cached transforms available")
+                batch1, batch2 = None,None
+                with timit.time("cut-ctf-1"):
+                    batch1 = kornia.geometry.transform.warp_perspective(torch.cat(cutouts[:self.cutn_zoom], dim=0), self.transforms[:self.cutn_zoom],
+                        (self.cut_size, self.cut_size), padding_mode=global_padding_mode)
+                with timit.time("cut-ctf-2"):
+                    batch2 = kornia.geometry.transform.warp_perspective(torch.cat(cutouts[self.cutn_zoom:], dim=0), self.transforms[self.cutn_zoom:],
+                        (self.cut_size, self.cut_size), padding_mode="fill", fill_value=global_fill_color)
+                batch = torch.cat([batch1, batch2])
+                # if cur_iteration < 2:
+                #     for j in range(4):
+                #         TF.to_pil_image(batch[j].cpu()).save(f"cached_im_{cur_iteration:02d}_{j:02d}_{spot}.png")
+                #         j_wide = j + self.cutn_zoom
+                #         TF.to_pil_image(batch[j_wide].cpu()).save(f"cached_im_{cur_iteration:02d}_{j_wide:02d}_{spot}.png")
+            else:
+                if False:
+                    batch1 = None
+                    batch2 = None
+                    with timit.time("cut-zoom"), record_function("cut1"):
+                        batch1 = self.augs_zoom(torch.cat(cutouts[:self.cutn_zoom], dim=0))
+                    with timit.time("cut-wide"), record_function("cut2"):
+                        batch2 = self.augs_wide(torch.cat(cutouts[self.cutn_zoom:], dim=0))
+                    # print(batch1.shape, batch2.shape)
+                    batch = torch.cat([batch1, batch2])
                 else:
-                    cutout = kornia.geometry.transform.rescale(cutout, (1/global_aspect_width, 1))
-
-            # if cur_iteration % 50 == 0 and _ == 0:
-            #     print(cutout.shape)
-            #     TF.to_pil_image(cutout[0].cpu()).save(f"cutout_im_{cur_iteration:02d}_{spot}.png")
-
-            cutouts.append(cutout)
-        timit.timit.stop("cutmk")
-
-        timit.timit.start("cuttf")
-        if self.transforms is not None:
-            # print("Cached transforms available")
-            batch1 = kornia.geometry.transform.warp_perspective(torch.cat(cutouts[:self.cutn_zoom], dim=0), self.transforms[:self.cutn_zoom],
-                (self.cut_size, self.cut_size), padding_mode=global_padding_mode)
-            batch2 = kornia.geometry.transform.warp_perspective(torch.cat(cutouts[self.cutn_zoom:], dim=0), self.transforms[self.cutn_zoom:],
-                (self.cut_size, self.cut_size), padding_mode="fill", fill_value=global_fill_color)
-            batch = torch.cat([batch1, batch2])
-            # if cur_iteration < 2:
-            #     for j in range(4):
-            #         TF.to_pil_image(batch[j].cpu()).save(f"cached_im_{cur_iteration:02d}_{j:02d}_{spot}.png")
-            #         j_wide = j + self.cutn_zoom
-            #         TF.to_pil_image(batch[j_wide].cpu()).save(f"cached_im_{cur_iteration:02d}_{j_wide:02d}_{spot}.png")
-        else:
-            batch1, transforms1 = self.augs_zoom(torch.cat(cutouts[:self.cutn_zoom], dim=0))
-            batch2, transforms2 = self.augs_wide(torch.cat(cutouts[self.cutn_zoom:], dim=0))
-            # print(batch1.shape, batch2.shape)
-            batch = torch.cat([batch1, batch2])
-            # print(batch.shape)
-            self.transforms = torch.cat([transforms1, transforms2])
-            ## batch, self.transforms = self.augs(torch.cat(cutouts, dim=0))
-            # if cur_iteration < 4:
-            #     for j in range(4):
-            #         TF.to_pil_image(batch[j].cpu()).save(f"live_im_{cur_iteration:02d}_{j:02d}_{spot}.png")
-            #         j_wide = j + self.cutn_zoom
-            #         TF.to_pil_image(batch[j_wide].cpu()).save(f"live_im_{cur_iteration:02d}_{j_wide:02d}_{spot}.png")
-        timit.timit.stop("cuttf")
+                    if self.cutn == 1:
+                        with timit.time("cut-wide"), record_function("cut"):
+                            batch, transforms = self.augs_wide(cutouts[0])
+                    else:
+                        batch1, transforms1, batch2, transforms2 = None,None,None,None
+                        with timit.time("cut-zoom"), record_function("cut1"):
+                            batch1, transforms1 = self.augs_zoom(torch.cat(cutouts[:self.cutn_zoom], dim=0))
+                        with timit.time("cut-wide"), record_function("cut2"):
+                            batch2, transforms2 = self.augs_wide(torch.cat(cutouts[self.cutn_zoom:], dim=0))
+                        # print(batch1.shape, batch2.shape)
+                        batch = torch.cat([batch1, batch2])
+                        # print(batch.shape)
+                        self.transforms = torch.cat([transforms1, transforms2])
+                        ## batch, self.transforms = self.augs(torch.cat(cutouts, dim=0))
+                        # if cur_iteration < 4:
+                        #     for j in range(4):
+                        #         TF.to_pil_image(batch[j].cpu()).save(f"live_im_{cur_iteration:02d}_{j:02d}_{spot}.png")
+                        #         j_wide = j + self.cutn_zoom
+                        #         TF.to_pil_image(batch[j_wide].cpu()).save(f"live_im_{cur_iteration:02d}_{j_wide:02d}_{spot}.png")
 
         # print(batch.shape, self.transforms.shape)
         bounds = [0,1]
 
-        if self.noise_fac and False:
-            facs = batch.new_empty([self.cutn, 1, 1, 1]).uniform_(0, self.noise_fac)
-            ran = torch.randn_like(batch)
-            batch = batch + facs * ran
-            bounds = [int(batch.min()),int(batch.max())]
+        if self.noise_fac:
+            with timit.time("cut-noise"):
+                facs = batch.new_empty([self.cutn, 1, 1, 1]).uniform_(0, self.noise_fac)
+                ran = torch.randn_like(batch)
+                batch = batch + facs * ran
+                bounds = [int(batch.min()),int(batch.max())]
         return batch, bounds
 
 
@@ -533,7 +583,7 @@ def rebuild_optimisers(args):
     if new_opts == None:
         # legacy
 
-        dropped_learning_rate = args.learning_rate/drop_divisor;
+        dropped_learning_rate = args.learning_rate/drop_divisor
         # print(f"Optimizing with {args.optimiser} set to {dropped_learning_rate}")
 
         #temporary hack
@@ -542,6 +592,8 @@ def rebuild_optimisers(args):
 
         # Set the optimiser
         to_optimize = [ drawer.get_z() ]
+        print("opt: [" + ", ".join([str(tuple(t.size())) for t in to_optimize]) + "]")
+
         if args.optimiser == "Adam":
             opt = optim.Adam(to_optimize, lr=dropped_learning_rate)        # LR=0.1
         elif args.optimiser == "AdamW":
@@ -654,7 +706,7 @@ def do_init(args):
         cut_size = perceptor.input_resolution
         cutoutSizeTable[clip_model] = cut_size
         if not cut_size in cutoutsTable:    
-            make_cutouts = MakeCutouts(cut_size, args.num_cuts, cut_pow=args.cut_pow)
+            make_cutouts = MakeCutouts(cut_size, args.num_cuts, args, cut_pow=args.cut_pow)
             cutoutsTable[cut_size] = make_cutouts
 
     filters = None
@@ -1060,6 +1112,8 @@ num_loss_drop = 0
 max_loss_drops = 2
 iter_drop_delay = 20
 
+nocut_proc = {}
+
 # session globals
 cutoutsTable = {}
 cutoutSizeTable = {}
@@ -1165,14 +1219,17 @@ def getPngInfo():
     return global_cached_png_info 
 
 @torch.no_grad()
-def checkin(args, iter, losses):
+def checkin(args, iter, losses, losseslabeled:dict=None):
     global drawer, filters
     global best_loss, best_iter, best_z, num_loss_drop, max_loss_drops, iter_drop_delay
 
     num_cycles_not_best = iter - best_iter
 
     if losses is not None:
-        losses_str = ', '.join(f'{loss.item():2.3g}' for loss in losses)
+        if losseslabeled == None:
+            losses_str = ', '.join(f'{loss.item():2.3g}' for loss in losses)
+        else:
+            losses_str = ", ".join("{}:{:2.3g}".format(key,losseslabeled[key]) for key in losseslabeled)
         writestr = f'iter: {iter}, loss: {sum(losses).item():1.3g}, losses: {losses_str}'
     else:
         writestr = f'iter: {iter}, finished'
@@ -1185,7 +1242,7 @@ def checkin(args, iter, losses):
     if filters is not None and len(filters)>0:
         for f in filters:
             filtclass = f["filter"]
-            timg, closs = filtclass(timg);
+            timg, closs = filtclass(timg)
 
     img = TF.to_pil_image(timg[0].cpu())
     # img = drawer.to_image()
@@ -1214,6 +1271,7 @@ def ascend_txt(args): # judge image?
     global pmsTable, pmsImageTable, spotPmsTable, spotOffPmsTable, global_padding_mode, global_fill_color
     global pmsTargetTable
     global lossGlobals
+    global nocut_proc
 
     if args.transparency:
         out, alpha = drawer.synth(cur_iteration, return_transparency=True)
@@ -1221,6 +1279,7 @@ def ascend_txt(args): # judge image?
         out = drawer.synth(cur_iteration)
 
     result = []
+    result_labled = {}
 
     if filters is not None and len(filters)>0:
         for f in filters:
@@ -1229,6 +1288,7 @@ def ascend_txt(args): # judge image?
             out, new_losses = filtclass(out)
             if type(new_losses) is not list and type(new_losses) is not tuple:
                 result.append(filtweight * new_losses)
+                result_labled["filter: " + f] = float(filtweight * new_losses)
             else:
                 # warning: this path might be untested by current losses?
                 weighted_losses = [(filtweight * l) for l in new_losses]
@@ -1245,14 +1305,21 @@ def ascend_txt(args): # judge image?
     global_fill_color =torch.tensor([color_fill,color_fill,color_fill], device=device, dtype=torch.float)
 
     cur_cutouts = {}
+    cur_cutouts_orig = {}
     cur_spot_cutouts = {}
     cur_spot_off_cutouts = {}
-    timit.timit.start("cut")
-    for cutoutSize in cutoutsTable:
-        make_cutouts = cutoutsTable[cutoutSize]
-        res, bounds = make_cutouts(out)
-        cur_cutouts[cutoutSize] = [res,bounds]
-    timit.timit.stop("cut")
+    if not args.no_cuts:
+        with timit.time("cut"):
+            with record_function("cut"):
+                for cutoutSize in cutoutsTable:
+                    make_cutouts = cutoutsTable[cutoutSize]
+                    #from torchviz import make_dot
+                    
+                    res, bounds = make_cutouts(out)
+                    # make_dot(res, params=dict((make_cutouts.named_parameters()))).render("rnn_torchviz", format="png")
+                    # exit()
+                    cur_cutouts[cutoutSize] = [res,bounds]
+                    cur_cutouts_orig[cutoutSize] = res
 
     if args.spot_prompts:
         for cutoutSize in cutoutsTable:
@@ -1271,32 +1338,57 @@ def ascend_txt(args): # judge image?
             iii_s = perceptor.encode_image(cur_spot_cutouts[cutoutSize]).float()
             spotPms = spotPmsTable[clip_model]
             for prompt in spotPms:
-                result.append(prompt(iii_s))
+                res = prompt(iii_s)
+                result.append(res)
+                result_labled["m: {} spot_pmpt".format(clip_model)] = float(res)
 
         if args.spot_prompts_off:
             iii_so = perceptor.encode_image(cur_spot_off_cutouts[cutoutSize]).float()
             spotOffPms = spotOffPmsTable[clip_model]
             for prompt in spotOffPms:
-                result.append(prompt(iii_so))
+                res = prompt(iii_so)
+                result.append(res)
+                result_labled["m: {} spot_pmpt_off".format(clip_model)] = float(res)
 
 
-        timit.timit.start("enc")
-        [cutout, bounds] = cur_cutouts[cutoutSize]
-        iii = perceptor.encode_image(cutout,input_range=bounds).float()
-        timit.timit.stop("enc")
+        if cur_iteration == 99:
+            if not args.no_cuts:
+                for s in cur_cutouts:
+                    [cutout, bounds] = cur_cutouts[s]
+                    for i in range(cutout.size()[0]):
+                        img = TF.to_pil_image(cutout[i].cpu())
+                        img.save("cuts/{}[{}] {}.png".format(clip_model.replace("/","_"),i,s),pnginfo=getPngInfo())
+            else:
+                img = TF.to_pil_image(nocut_proc[cutoutSize](out[0]).cpu())
+                img.save("{}_nocut.png".format(clip_model.replace("/","_")),pnginfo=getPngInfo())
 
-        timit.timit.start("prompt")
-        pMs = pmsTable[clip_model]
-        for prompt in pMs:
-            result.append(prompt(iii))
-        timit.timit.stop("prompt")
+        iii = None
+        with timit.time("enc"), record_function("enc"):
+            if not args.no_cuts:
+                [cutout, bounds] = cur_cutouts[cutoutSize]
+                iii = perceptor.encode_image(cutout,input_range=bounds).float()
+            else:
+                if cutoutSize not in nocut_proc:
+                    nocut_proc[cutoutSize] = transforms.Compose([transforms.Resize((cutoutSize,cutoutSize))])
+                iii = perceptor.encode_image(nocut_proc[cutoutSize](out),input_range=(0,1)).float()
+
+        with timit.time("prompt"), record_function("prompt"):
+            pMs = pmsTable[clip_model]
+            i = 0
+            for prompt in pMs:
+                res = prompt(iii)
+                result.append(res)
+                result_labled["m: {} pmpt{}".format(clip_model,i)] = float(res)
+                i+=1
 
         # add target frame prompts if applicable
         if cur_anim_index is not None and len(pmsTargetTable[clip_model]) > 0:
             num_anim_frames = len(pmsTargetTable[clip_model])
             pmsTarget = [ pmsTargetTable[clip_model][cur_anim_index % num_anim_frames] ]
             for prompt in pmsTarget:
-                result.append(prompt(iii))
+                res = prompt(iii)
+                result.append(res)
+                result_labled["m: {} pmpt anim".format(clip_model)] = float(res)
 
         # If there are image prompts we make cutouts for those each time
         # so that they line up with the current cutouts from augmentation
@@ -1326,7 +1418,9 @@ def ascend_txt(args): # judge image?
                 transient_pMs.append(Prompt(embed).to(device))
 
         for prompt in transient_pMs:
-            result.append(prompt(iii))
+            res = prompt(iii)
+            result.append(res)
+            result_labled["m: {} pmpt tpM".format(clip_model)] = float(res)
 
 
     for cutoutSize in cutoutsTable:
@@ -1347,11 +1441,13 @@ def ascend_txt(args): # judge image?
         f2 = z_orig.reshape(1,-1)
         cur_loss = spherical_dist_loss(f, f2) * args.init_weight
         result.append(cur_loss[0])
+        result_labled["init_whgt".format(clip_model)] = float(cur_loss[0])
 
     # these three init_weight variants offer mse_loss, mse_loss in pixel space, and cos loss
     if args.init_weight_dist:
         cur_loss = F.mse_loss(drawer.get_z(), z_orig) * args.init_weight_dist / 2
         result.append(cur_loss)
+        result_labled["init_whgt_dist".format(clip_model)] = float(cur_loss)
 
     if args.init_weight_pix:
         if init_image_tensor is None:
@@ -1359,6 +1455,7 @@ def ascend_txt(args): # judge image?
         else:
             cur_loss = F.l1_loss(out, init_image_tensor) * args.init_weight_pix / 2
             result.append(cur_loss)
+            result_labled["init_pix".format(clip_model)] = float(cur_loss)
 
     if args.init_weight_cos:
         f = drawer.get_z().reshape(1,-1)
@@ -1380,7 +1477,7 @@ def ascend_txt(args): # judge image?
         for t in args.custom_loss:
             lossclass = t["loss"]
             lossweight = t["weight"]
-            new_losses = lossclass.get_loss(cur_cutouts, out, args, globals = needed_globals, lossGlobals = lossGlobals)
+            new_losses = lossclass.get_loss(cur_cutouts_orig, out, args, globals = needed_globals, lossGlobals = lossGlobals)
             if type(new_losses) is not list and type(new_losses) is not tuple:
                 result.append(lossweight * new_losses)
             else:
@@ -1393,7 +1490,7 @@ def ascend_txt(args): # judge image?
         img = np.transpose(img, (1, 2, 0))
         imageio.imwrite(f'./steps/frame_{cur_iteration:04d}.png', np.array(img))
 
-    return result
+    return result, result_labled
 
 def re_average_z(args):
     global gside_X, gside_Y
@@ -1453,37 +1550,33 @@ def train(args, cur_it: int) -> bool:
         # num_batches = args.batches * (num_loss_drop + 1)
         num_batches = args.batches
         for i in range(num_batches):
-            timit.timit.start("ascend")
-            lossAll = ascend_txt(args)
-            timit.timit.stop("ascend")
+            lossAll = None
+            with timit.time("ascend_txt"):
+                with record_function("ascend_txt"):
+                    lossAll, lossAllLabels = ascend_txt(args)
 
-            timit.timit.start("check")
-            if i == 0:
-                # check for lerning rate drop?
-                if cur_anim_index is None or cur_anim_index == 0:
-                    if cur_it in args.learning_rate_drops:
-                        print("Dropping learning rate")
-                        rebuild_opts_when_done = True
-                    else:
-                        if args.auto_stop is True:
-                            rebuild_opts_when_done = checkdrop(args, cur_it, lossAll)
+            with timit.time("check"):
+                if i == 0:
+                    # check for lerning rate drop?
+                    if cur_anim_index is None or cur_anim_index == 0:
+                        if cur_it in args.learning_rate_drops:
+                            print("Dropping learning rate")
+                            rebuild_opts_when_done = True
+                        else:
+                            if args.auto_stop is True:
+                                rebuild_opts_when_done = checkdrop(args, cur_it, lossAll)
 
-                # save/display image?
-                if cur_it % args.save_every == 0:
-                    checkin(args, cur_it, lossAll)
-
-            timit.timit.stop("check")
+                    # save/display image?
+                    if cur_it % args.save_every == 0:
+                        checkin(args, cur_it, lossAll, lossAllLabels)
             
-            timit.timit.start("back")
-            loss = sum(lossAll)
-            loss.backward()
-            del loss
-            timit.timit.stop("back")
+            with timit.time("backward"), record_function("backward"):
+                loss = sum(lossAll)
+                loss.backward()
 
-        timit.timit.start("step")
-        for opt in opts:
-            opt.step()
-        timit.timit.stop("step")
+        with timit.time("step"), record_function("step"):
+            for opt in opts:
+                opt.step()
 
         drawer.clip_z()
 
@@ -1614,9 +1707,9 @@ def do_run(args, return_display=False, debug=True):
             with tqdm() as pbar:
                 while keep_going:
                     try:
-                        timit.timit.start("train")
-                        keep_going = train(args, cur_iteration)
-                        timit.timit.stop("train")
+                        with timit.time("train"):
+                            keep_going = train(args, cur_iteration)
+                        
                         if cur_iteration == args.iterations:
                             break
                         cur_iteration += 1
@@ -1753,6 +1846,7 @@ def setup_parser(vq_parser):
     vq_parser.add_argument("--alpha_gamma", type=float, help="width-relative sigma for the alpha gaussian", default=4., dest='alpha_gamma')
     vq_parser.add_argument("--output", type=str, help="Output filename", default="output.png", dest='output')
     vq_parser.add_argument("--outdir", type=str, help="Output file directory", default='outputs/%DATE%_%SEQ%', dest='outdir')
+    vq_parser.add_argument("--no_cuts", type=bool, help="Do no cuts", default=False, dest='no_cuts')
 
     return vq_parser
 
@@ -1861,7 +1955,7 @@ def process_args(vq_parser, namespace=None):
     if args.batches is None:
         args.batches = quality_to_batches_table[args.quality]
     if args.ezsize is None and args.scale is None:
-        args.scale = quality_to_scale_table[args.quality] if args.drawer not in ["fast_pixel"] else 2
+        args.scale = quality_to_scale_table[args.quality] #if args.drawer not in ["fast_pixel"] else 2
 
     size_to_scale_table = {
         'small': 1,
@@ -2091,21 +2185,19 @@ def command_line_override():
 
 # super-userful one stop shopping from notebooks or other python code
 def run(prompts=None, drawer="vqgan", **kwargs):
-    timit.timit.init()
+    timit.init()
     reset_settings()
     add_settings(prompts=prompts, drawer=drawer, **kwargs)
     settings = apply_settings()
 
-    timit.timit.start("init")
-    do_init(settings)
-    timit.timit.stop("init")
-    timit.timit.start("run")
-    do_run(settings)
-    timit.timit.stop("run")
+    with timit.time("init"):
+        do_init(settings)
+    with timit.time("run"):
+        do_run(settings)
 
     print("done")
-    timit.timit.end()
-    timit.timit.print()
+    timit.end()
+    timit.print()
 
 def main():
     settings = apply_settings()

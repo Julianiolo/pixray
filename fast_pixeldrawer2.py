@@ -39,7 +39,7 @@ class FastPixelDrawer(DrawingInterface):
     def load_model(self, settings, device):
         pass
 
-    def get_opts(self, decay_divisor):
+    def get_opts(self, decay_divisor=1):
         return None
 
     def init_from_tensor(self, init_tensor):
@@ -52,13 +52,14 @@ class FastPixelDrawer(DrawingInterface):
             self.z.copy_(new_z)
 
     def get_z_from_tensor(self, ref_tensor):
-        return F.interpolate((ref_tensor + 1) / 2, size=self.pixel_size, mode="bilinear", align_corners=False)
+        return F.interpolate((ref_tensor + 1) / 2, size=self.pixel_size, mode="bilinear", align_corners=False).reshape(3,self.pixel_size[0]*self.pixel_size[1]) #downscale
 
     def get_num_resolutions(self):
         return None
 
     def synth(self, cur_iteration):
-        output = F.interpolate(self.z, size=self.output_size, mode="nearest")
+        inp = self.z.reshape(1,3,self.pixel_size[0],self.pixel_size[1])
+        output = F.interpolate(inp, size=self.output_size, mode="nearest") #upscale
         return clamp_with_grad(output, 0, 1)
 
     @torch.no_grad()
@@ -71,13 +72,7 @@ class FastPixelDrawer(DrawingInterface):
             self.z.copy_(self.z.clip(0, 1))
 
     def get_z(self):
-        if False:
-            return self.z
-        else:
-            groups = []
-            
-            groups.requires_grad_(True)
-            return groups
+        return self.z
 
     def set_z(self, new_z):
         with torch.no_grad():

@@ -3,6 +3,7 @@
 import sys
 import os
 from collections import OrderedDict
+from typing import List
 
 import torch 
 import torch.nn as nn
@@ -10,12 +11,58 @@ from torchvision import transforms
 
 from clip import clip
 
-import timit
+from timit import timit
 
 all_slip_models =  ["SLIP_VITS16", "SLIP_VITB16", "SLIP_VITL16",
                     "SLIP_CC3M", "SLIP_CC12M",
                     "SIMCLR_VITS16",
                     "CLIP_VITS16", "CLIP_VITB16", "CLIP_VITL16"]
+
+class Normalize_(torch.nn.Module):
+    def __init__(self, mean, std, dtype, device, inplace=False):
+        super().__init__()
+        self.mean = torch.as_tensor(mean, dtype=dtype, device=device)
+        self.std = torch.as_tensor(std, dtype=dtype, device=device)
+        self.inplace = inplace
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        def normalize__(tensor: torch.Tensor, mean: List[float], std: List[float], inplace: bool = False) -> torch.Tensor:
+            with timit.time("Norm-errh1"):
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError('Input tensor should be a torch tensor. Got {}.'.format(type(tensor)))
+
+                if not tensor.is_floating_point():
+                    raise TypeError('Input tensor should be a float tensor. Got {}.'.format(tensor.dtype))
+
+                if tensor.ndim < 3:
+                    raise ValueError('Expected tensor to be a tensor image of size (..., C, H, W). Got tensor.size() = '
+                                    '{}.'.format(tensor.size()))
+
+            if not inplace:
+                with timit.time("Norm-clone"):
+                    tensor = tensor.clone()
+
+            # with timit.time("Norm-errh2"):
+            #     if (std == 0).any():
+            #         raise ValueError('std evaluated to zero after conversion to {}, leading to division by zero.'.format(dtype))
+            
+            with timit.time("Norm-view"):
+                if mean.ndim == 1:
+                    mean = mean.view(-1, 1, 1)
+                if std.ndim == 1:
+                    std = std.view(-1, 1, 1)
+            
+            with timit.time("Norm-norm"):
+                tensor.sub_(mean).div_(std)
+            return tensor
+
+        with timit.time("Norm-call"):
+            n = normalize__(tensor, self.mean, self.std, self.inplace)
+
+        return n
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
 
 from util import wget_file
@@ -38,13 +85,11 @@ def normalize(img, input_range = None):
     return img
 
 def adjust_range(img, out_range, input_range = None):
-    timit.timit.start("adj")
-    timit.timit.start("norm")
-    img = normalize(img, input_range = input_range)
-    timit.timit.stop("norm")
-    img = img * (out_range[1] - out_range[0])
-    img = img + out_range[0]
-    timit.timit.stop("adj")
+    with timit.time("adj"):
+        with timit.time("norm"):
+            img = normalize(img, input_range = input_range)
+        img = img * (out_range[1] - out_range[0])
+        img = img + out_range[0]
     return img
 
 class CLIP_Base():
@@ -55,50 +100,49 @@ class CLIP_Base():
         self.input_resolution = self.model.visual.input_resolution
         self.output_dim = self.model.visual.output_dim
 
-        self.preprocess_transform = transforms.Compose([
+        self.preprocess_transform = torch.nn.Sequential(
             transforms.Resize(self.input_resolution),
             transforms.CenterCrop(self.input_resolution),
             transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
-        ])
+            #Normalize_((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+        ).to(device)
 
-        # self.pre_R = transforms.Resize(self.input_resolution)
-        # self.pre_C = transforms.CenterCrop(self.input_resolution)
-        # self.pre_N = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+        self.pre_R = transforms.Resize(self.input_resolution)
+        self.pre_C = transforms.CenterCrop(self.input_resolution)
+        #self.pre_N = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+        self.pre_N = Normalize_((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711), torch.float32, device)
 
     def preprocess(self, imgs, input_range = None):
         imgs = adjust_range(imgs, [0.,1.], input_range = input_range)
 
         proc = None
-        timit.timit.start("tf")
-        if True:
-            proc = self.preprocess_transform(imgs)
-        else:
-            timit.timit.start("tf-r")
-            p1 = self.pre_R(imgs)
-            timit.timit.stop("tf-r")
-            timit.timit.start("tf-c")
-            p2 = self.pre_C(p1)
-            timit.timit.stop("tf-c")
-            timit.timit.start("tf-n")
-            proc = self.pre_N(p2)
-            timit.timit.stop("tf-n")
+        with timit.time("tf"):
+            if True:
+                proc = self.preprocess_transform(imgs)
+            else:
+                p1 = None
+                p2 = None
+                with timit.time("tf-r"):
+                    p1 = self.pre_R(imgs)
+                with timit.time("tf-c"):
+                    p2 = self.pre_C(p1)
+                with timit.time("tf-n"):
+                    proc = self.pre_N(p2)
 
-        timit.timit.stop("tf")
         return proc
 
     def encode_image(self, imgs, input_range = None, apply_preprocess = True):
         if apply_preprocess:
-            timit.timit.start("preproc")
-            imgs = self.preprocess(imgs, input_range = input_range)
-            timit.timit.stop("preproc")
+            with timit.time("preproc"):
+                imgs = self.preprocess(imgs, input_range = input_range)
         
-        timit.timit.start("encmod")
-        img_embeddings = self.model.encode_image(imgs)
-        timit.timit.stop("encmod")
+        img_embeddings = None
+        with timit.time("encmod"):
+            img_embeddings = self.model.encode_image(imgs)
 
-        timit.timit.start("encnorm")
-        ret = img_embeddings / img_embeddings.norm(dim=-1, keepdim=True)
-        timit.timit.stop("encnorm")
+        ret = None
+        with timit.time("encnorm"):
+            ret = img_embeddings / img_embeddings.norm(dim=-1, keepdim=True)
         return ret
 
     def encode_text(self, text):
@@ -186,9 +230,8 @@ class SLIP_Base():
 
     def encode_image(self, imgs, input_range = None, apply_preprocess = True):
         if apply_preprocess:
-            timit.timit.start("preproc")
-            imgs = self.preprocess(imgs, input_range = input_range)
-            timit.timit.stop("preproc")
+            with timit.time("preproc"):
+                imgs = self.preprocess(imgs, input_range = input_range)
 
         image_features = self.model.encode_image(imgs)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
